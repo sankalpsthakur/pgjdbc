@@ -493,6 +493,12 @@ public class QueryExecutorImpl extends QueryExecutorBase {
         handler.handleError(
             new PSQLException(GT.tr("An I/O error occurred while sending to the backend."),
                 PSQLState.CONNECTION_FAILURE, e));
+      } catch (Throwable e) {
+        // A failure other than IOException (a PSQLException from converting a stream
+        // parameter, a RuntimeException from a result handler, and similar) leaves
+        // the connection out of sync. Close it so a pool does not reuse it.
+        abort();
+        throw e;
       }
 
       try {
@@ -727,6 +733,12 @@ public class QueryExecutorImpl extends QueryExecutorBase {
         handler.handleError(
             new PSQLException(GT.tr("An I/O error occurred while sending to the backend."),
                 PSQLState.CONNECTION_FAILURE, e));
+      } catch (Throwable e) {
+        // A failure other than IOException (a PSQLException from converting a stream
+        // parameter, a RuntimeException from a result handler, and similar) leaves
+        // the connection out of sync. Close it so a pool does not reuse it.
+        abort();
+        throw e;
       }
 
       try {
@@ -2294,9 +2306,18 @@ public class QueryExecutorImpl extends QueryExecutorBase {
       sendSync();
     }
 
-    String nativeSql = query.toString(
-        params,
-        SqlSerializationContext.of(getStandardConformingStrings(), false));
+    String nativeSql;
+    try {
+      nativeSql = query.toString(
+          params,
+          SqlSerializationContext.of(getStandardConformingStrings(), false));
+    } catch (Exception e) {
+      // Report a conversion failure as a bind error so a broken InputStream
+      // fails the statement without aborting a connection that has not sent
+      // this query yet. execute(Query, ...) recovers from PGBindException;
+      // a PSQLException from SimpleParameterList.toString would skip that path.
+      throw pgBindException(e);
+    }
 
     LOGGER.log(Level.FINEST, " FE=> SimpleQuery(query=\"{0}\")", nativeSql);
     Encoding encoding = pgStream.getEncoding();
@@ -2308,6 +2329,20 @@ public class QueryExecutorImpl extends QueryExecutorBase {
     pgStream.sendChar(0);
     pendingExecuteQueue.add(new ExecuteRequest(query, null, true));
     pendingDescribePortalQueue.add(query);
+  }
+
+  private static PGBindException pgBindException(Exception e) {
+    if (e instanceof PGBindException) {
+      return (PGBindException) e;
+    }
+    if (e instanceof IOException) {
+      return new PGBindException((IOException) e);
+    }
+    Throwable cause = e.getCause();
+    if (cause instanceof IOException) {
+      return new PGBindException((IOException) cause);
+    }
+    return new PGBindException(new IOException(e.getMessage(), e));
   }
 
   //
@@ -2929,6 +2964,11 @@ public class QueryExecutorImpl extends QueryExecutorBase {
         handler.handleError(
             new PSQLException(GT.tr("An I/O error occurred while sending to the backend."),
                 PSQLState.CONNECTION_FAILURE, e));
+      } catch (Throwable e) {
+        // A failure other than IOException leaves the connection out of sync.
+        // Close it so a pool does not reuse it.
+        abort();
+        throw e;
       }
 
       handler.handleCompletion();
